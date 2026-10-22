@@ -46,6 +46,8 @@ Optionally, add a spectrum of the same spot with the other polarizer setting. It
 
 **Hand-held / unstable coupling.** The lamp and pair modes divide spectra taken at different times, so a changing intensity scale or spectral tilt between them distorts T. The minima mode is insensitive to this, as long as the spectrometer records all wavelengths at the same time (array spectrometer).
 
+**Fit range.** Drag in the transmission plot to set the λ fit window: drag inside it to move it, drag its edges to resize it, or drag elsewhere to draw a new one. The λ-range fields follow, and an existing fit is redone automatically. Zoom/pan mode of the toolbar has to be off.
+
 * **Use first estimate** ticked: scan only `d0 ± window`.
 * Unticked: scan the full range (default 1–60 µm).
 

@@ -12,6 +12,7 @@ from matplotlib.backends.backend_qt5agg import (
     NavigationToolbar2QT as NavigationToolbar,
 )
 from matplotlib.figure import Figure
+from matplotlib.widgets import SpanSelector
 
 import model
 from dispersion import CUSTOM, MATERIALS, Cauchy
@@ -83,6 +84,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fit_curve = None
         self.sample = self.ref = self.dark = None
         self.T = self.S = self.minima = None
+        self.span = None    # draggable fit window in the transmission plot
         self.S2 = self.minima2 = None
 
         # ------------------------------------------------ left panel
@@ -656,11 +658,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.S2 is not None:
                     for x in self.fit_curve[2]:
                         ax.axvline(x, color="C2", lw=0.8, ls="--", alpha=0.7)
-            ax.axvspan(self.lam_min.value(), self.lam_max.value(),
-                       color="0.5", alpha=0.12)
             ax.legend(fontsize=8)
             ax.set_ylabel("counts")
-            ax.set_title("Measured spectrum (minima mode)")
+            ax.set_title("Measured spectrum, minima mode (drag: fit range)")
         if self.T is not None:
             ax.plot(*self.T, lw=1, color="C0", label="measured")
             if self.fit_curve is not None:
@@ -669,8 +669,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 ax.plot(lam_f, T_f, lw=0.8, color="C1", alpha=0.35)
                 ax.plot(lam_f[m], T_f[m], lw=1.5, color="C1",
                         label=f"fit, d = {self.result.d:.3f} µm")
-            ax.axvspan(self.lam_min.value(), self.lam_max.value(),
-                       color="0.5", alpha=0.12)
             ax.legend(fontsize=8)
             Tv = self.T[1][np.isfinite(self.T[1])]
             if Tv.size:
@@ -679,7 +677,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ax.set_xlabel("λ [nm]")
         if self.S is None:
             ax.set_ylabel("T (normalized)")
-            ax.set_title("Normalized transmission")
+            ax.set_title("Normalized transmission (drag: fit range)")
+        self.make_span_selector(ax, self.S is not None or self.T is not None)
 
         ax = self.ax_scan
         if self.result is not None:
@@ -696,6 +695,35 @@ class MainWindow(QtWidgets.QMainWindow):
         ax.set_title("Thickness scan (global search)")
 
         self.canvas.draw_idle()
+
+    def make_span_selector(self, ax, active):
+        """(Re)create the draggable λ window; ax.clear() removes its artists."""
+        if self.span is not None:
+            self.span.disconnect_events()
+            self.span = None
+        if not active:
+            return
+        self.span = SpanSelector(
+            ax, self.span_selected, "horizontal", minspan=5, useblit=True,
+            props=dict(facecolor="0.5", alpha=0.15), interactive=True,
+            drag_from_anywhere=True)
+        self.span.extents = (self.lam_min.value(), self.lam_max.value())
+
+    def span_selected(self, lo, hi):
+        # defer: the redraw replaces the selector that is calling us
+        QtCore.QTimer.singleShot(0, lambda: self.apply_span(lo, hi))
+
+    def apply_span(self, lo, hi):
+        if hi - lo < 5:
+            return
+        refit = self.result is not None
+        for w, v in ((self.lam_min, lo), (self.lam_max, hi)):
+            w.blockSignals(True)
+            w.setValue(round(v))
+            w.blockSignals(False)
+        self.data_changed()
+        if refit:
+            self.run_fit()
 
     # ------------------------------------------------------------ save
     def save(self):
