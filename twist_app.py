@@ -6,7 +6,7 @@ the rubbing, as patterned: e.g. 0, +80, −80), polarizer P and analyzer A
 (lab angles, same rotation sense as θ). One region → W with δ fixed;
 two or three regions → δ (pattern rotation vs rubbing) is fitted as well.
 
-Run:  ~/.venv/base/bin/python twist_app.py
+Run:  uv run twist_app.py [measurement folder]
 Physics and conventions: twist_model.py and the analysis note
 "Anchoring strength from twisted-cell spectra" in the notes vault.
 """
@@ -81,6 +81,19 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_load.clicked.connect(self.load_list)
         btn_save.clicked.connect(self.save_list)
         self.theta_new = dspin(-89.9, 89.9, 0.0, 1, 5.0, "°")
+        # measurement folder from twist_acquire.py (preferred input)
+        self.folder = None
+        self.folder_edit = QtWidgets.QLineEdit()
+        self.folder_edit.setReadOnly(True)
+        self.folder_edit.setPlaceholderText("measurement folder from twist_acquire.py")
+        btn_folder = QtWidgets.QPushButton("Open folder…")
+        btn_unfolder = QtWidgets.QPushButton("×"); btn_unfolder.setFixedWidth(30)
+        btn_folder.clicked.connect(self.open_folder)
+        btn_unfolder.clicked.connect(self.close_folder)
+        fl = QtWidgets.QHBoxLayout()
+        fl.addWidget(QtWidgets.QLabel("Measurement folder"))
+        fl.addWidget(self.folder_edit, 1); fl.addWidget(btn_folder); fl.addWidget(btn_unfolder)
+        self.manual_widgets = [btn_add, btn_rm, btn_load, btn_save, self.theta_new]
         tb = QtWidgets.QHBoxLayout()
         for w in (btn_add, QtWidgets.QLabel("with θ ="), self.theta_new,
                   btn_rm, btn_load, btn_save):
@@ -95,7 +108,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.k22 = dspin(0.1, 50, 6.2, 2, 0.1, " pN")
         self.dmin = dspin(0.5, 200, 5.0, 2, 1, " µm")
         self.dmax = dspin(0.5, 200, 40.0, 2, 1, " µm")
-        self.lmin = dspin(300, 2000, 450, 0, 10, " nm")
+        self.lmin = dspin(300, 2000, 480, 0, 10, " nm")
         self.lmax = dspin(300, 2000, 700, 0, 10, " nm")
         self.lamcol = QtWidgets.QSpinBox(); self.lamcol.setRange(1, 50); self.lamcol.setValue(1)
         self.intcol = QtWidgets.QSpinBox(); self.intcol.setRange(1, 50); self.intcol.setValue(2)
@@ -150,6 +163,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         left = QtWidgets.QWidget()
         ll = QtWidgets.QVBoxLayout(left)
+        ll.addLayout(fl)
         ll.addLayout(tb)
         ll.addWidget(self.table, 2)
         ll.addLayout(form)
@@ -214,6 +228,46 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.showMessage(f"{missing} file(s): P/A not found in the name "
                                     "(pattern …P30_A120…); set them in the table.", 8000)
 
+    def open_folder(self, d=None):
+        if not d:
+            d = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Measurement folder", self.qs.value("dir", ""))
+        if not d:
+            return
+        try:
+            spectra, warn, meta = tm.load_measurement(d)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Measurement folder", str(e)); return
+        self.qs.setValue("dir", os.path.dirname(d))
+        self.folder = d
+        self.folder_edit.setText(d)
+        self.table.setRowCount(0)
+        for sp in spectra:
+            self.add_row(tm.Row(os.path.join(d, sp.label), sp.theta, sp.P, sp.A))
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        for w in self.manual_widgets + [self.norm, self.ref, self.dark,
+                                        self.lamcol, self.intcol]:
+            w.setEnabled(False)
+        regions = sorted({sp.theta for sp in spectra})
+        msg = (f"{meta.get('sample', '')}: {len(spectra)} crossed/parallel pairs, "
+               f"regions θ = {', '.join(f'{t:+g}°' for t in regions)}")
+        if meta.get("simulated"):
+            msg += "  [SIMULATED DATA]"
+        self.status.showMessage(msg, 10000)
+        if warn:
+            self.report.setPlainText("\n".join("! " + w for w in warn))
+
+    def close_folder(self):
+        self.folder = None
+        self.folder_edit.clear()
+        self.table.setRowCount(0)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked
+                                   | QtWidgets.QAbstractItemView.EditKeyPressed
+                                   | QtWidgets.QAbstractItemView.AnyKeyPressed)
+        for w in self.manual_widgets + [self.norm, self.ref, self.dark,
+                                        self.lamcol, self.intcol]:
+            w.setEnabled(True)
+
     def remove_rows(self):
         for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
             self.table.removeRow(r)
@@ -262,16 +316,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def run_fit(self):
         try:
-            rows = self.rows()
-            if not rows:
-                raise ValueError("Add spectra first.")
             s = self.settings()
             if s.d_range[0] >= s.d_range[1] or s.lam_range[0] >= s.lam_range[1]:
                 raise ValueError("Check the d and λ ranges.")
-            self.spectra, self.warn = tm.build_spectra(
-                rows, self.norm.currentData(), self.lamcol.value() - 1,
-                self.intcol.value() - 1, self.ref.text() or None,
-                self.dark.text() or None)
+            if self.folder:
+                self.spectra, self.warn, _ = tm.load_measurement(self.folder)
+            else:
+                rows = self.rows()
+                if not rows:
+                    raise ValueError("Open a measurement folder or add spectra first.")
+                self.spectra, self.warn = tm.build_spectra(
+                    rows, self.norm.currentData(), self.lamcol.value() - 1,
+                    self.intcol.value() - 1, self.ref.text() or None,
+                    self.dark.text() or None)
             if not self.spectra:
                 raise ValueError("No usable spectra.\n" + "\n".join(self.warn))
         except Exception as e:
@@ -282,16 +339,19 @@ class MainWindow(QtWidgets.QMainWindow):
             extra = {n: c.delta_n for n, c in MATERIALS[mat].items() if n != name}
         self.s = s
         self.btn_fit.setEnabled(False)
-        self.thread = QtCore.QThread()
+        old = getattr(self, "_thread", None)
+        if old is not None and old.isRunning():
+            old.quit(); old.wait()
+        self._thread = QtCore.QThread()
         self.worker = FitWorker(self.spectra, s, extra)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        self.worker.moveToThread(self._thread)
+        self._thread.started.connect(self.worker.run)
         self.worker.progress.connect(lambda m: self.status.showMessage(m))
         self.worker.done.connect(self.fit_done)
         self.worker.failed.connect(self.fit_failed)
-        self.worker.done.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.start()
+        self.worker.done.connect(self._thread.quit)
+        self.worker.failed.connect(self._thread.quit)
+        self._thread.start()
 
     def fit_failed(self, msg):
         self.btn_fit.setEnabled(True)
@@ -376,6 +436,8 @@ def main():
     w = MainWindow()
     w.resize(1400, 850)
     w.show()
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        w.open_folder(sys.argv[1])          # twist_app.py <measurement folder>
     sys.exit(app.exec_())
 
 

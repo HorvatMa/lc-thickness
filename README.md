@@ -3,8 +3,11 @@
 A Qt GUI that finds the thickness `d` of a planar nematic cell from its spectrum. The cell sits at 45° between crossed (or parallel) polarizers. Works in transmission or reflection.
 
 ```
-~/.venv/base/bin/python app.py      # needs PyQt5, numpy, scipy, matplotlib (requirements.txt)
+uv run app.py                       # uv project (pyproject.toml, uv.lock, Python 3.12)
 ```
+Without uv: `pip install -r requirements.txt` (PyQt5, numpy, scipy, matplotlib; plus `hidapi` for `twist_acquire.py`).
+
+The repo also contains the **twisted-cell anchoring** apps (see the section at the end).
 
 The full physics write-up (Jones calculus, dispersion and group birefringence, normalization modes, reflection, systematic errors, first results) is in the notes vault: `phd-notes/doc/dynamic-cell/analysis/Cell thickness from crossed-polarizer spectra.md`.
 
@@ -80,3 +83,18 @@ The loader accepts CSV/TXT with `,` `;` tab or whitespace delimiters and decimal
 - `app.py`: GUI
 - `model.py`: loading, normalization, scan + fit
 - `dispersion.py`: Cauchy coefficients and references
+- `twist_acquire.py`, `twist_app.py`, `twist_model.py`, `twist_demo.py`: twisted-cell anchoring (below)
+
+## Twisted-cell anchoring W (BY plate + rubbed plate)
+
+Measures the azimuthal anchoring W of a patterned (photoaligned) plate in a twisted cell whose other plate is rubbed (strong). Regions with the BY easy axis at θ = +80° and −80° from the rubbing cancel the pattern-vs-rubbing assembly offset δ. Physics, conventions and protocol: `phd-notes/doc/dynamic-cell/analysis/Anchoring strength from twisted-cell spectra.md`.
+
+```
+uv run twist_acquire.py [--simulate]     # guided acquisition (ASEQ LR2 spectrometer, rotation stage)
+uv run twist_app.py [measurement folder] # fit
+uv run twist_demo.py --check             # closed-form Jones matrix vs stepwise product
+```
+
+- **Acquisition** needs the [aseq-spectrometer](https://github.com/HorvatMa/aseq-spectrometer) repo next to this one (`aseq_spectrometer` or `aseq-spectrometer`) or `ASEQ_DIR` set. The app prompts for each region, stage angle ρ and crossed/parallel setting, sets the exposure (auto ladder 0.5–1000 ms or manual ⊥/∥), acquires and saves to `<date>_<sample>/` with `measurement.json`. Darks are taken at the start and end for each exposure. Click a step to redo it; *Resume folder…* continues a run.
+- **Angles:** the polarizer is the lab zero (analyzer 90° crossed, 0° parallel). A stage rotation ρ is stored as P = −sρ, A = A_lab − sρ, where s = ±1 is the stage sense relative to θ.
+- **Fit:** dark subtraction, division by exposure and ⊥/∥ pairing (T = S⊥/(S⊥+S∥)) come from the folder. The app first fits each region freely (d, ψ_rub, twist Φ), then does a joint Jones + Rapini–Papoular fit (d, ψ_rub, δ, W) with an analytic ±θ cross-check. ψ_rub is defined only mod 90° (T is even in Δn).

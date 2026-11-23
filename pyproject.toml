@@ -1,0 +1,19 @@
+[project]
+name = "lc-thickness"
+version = "0.1.0"
+description = "LC cell thickness and twisted-cell anchoring from polarized spectra (PyQt5 GUIs)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt5>=5.15",
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "hidapi",   # ASEQ spectrometer (twist_acquire.py imports aseq.py from the aseq-spectrometer repo)
+]
+
+[tool.uv]
+package = false
+# the newest PyQt5-Qt5 wheels are Linux/macOS only: make uv pick a version that
+# also exists for the Windows lab PC (same as aseq-spectrometer)
+required-environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]

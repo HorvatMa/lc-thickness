@@ -29,6 +29,7 @@ K22 that is assumed.
 """
 from dataclasses import dataclass, field
 import csv
+import json
 import os
 import re
 
@@ -216,6 +217,66 @@ def build_spectra(rows, mode, lam_col=0, int_col=1, ref_path=None,
         out.append(Spectrum(r.theta, r.P, r.A, lam, T,
                             os.path.basename(r.path)))
     return out, warn
+
+
+def load_measurement(folder, min_ref_fraction=0.05):
+    """Spectra from a twist_acquire measurement folder (measurement.json).
+
+    Each spectrum: S = (I − D(t))/t, with I offset-corrected counts, D(t) the
+    mean of the start and end dark at the same exposure t (if only one exposure
+    is missing, the nearest dark is scaled ∝ t). Pairs crossed/parallel at the
+    same θ and ρ give T = S⊥/(S⊥ + S∥), returned at the crossed P, A.
+    Returns (list of Spectrum, warnings, metadata dict).
+    """
+    with open(os.path.join(folder, "measurement.json")) as f:
+        meta = json.load(f)
+    warn = []
+
+    def read(fn):
+        lam, I = _load(os.path.join(folder, fn), 0, 1)
+        return lam, I
+
+    darks = {}
+    for d in meta.get("darks", []):
+        darks.setdefault(float(d["exposure_ms"]), []).append(read(d["file"]))
+    whens = {d["when"] for d in meta.get("darks", [])}
+    if not darks:
+        warn.append("No dark spectra: only the shielded-pixel offset is subtracted.")
+    elif whens != {"start", "end"}:
+        warn.append(f"Dark spectra only at {', '.join(sorted(whens))}.")
+
+    def dark(lam, t):
+        if not darks:
+            return 0.0
+        if t in darks:
+            return np.mean([np.interp(lam, *x) for x in darks[t]], axis=0)
+        tn = min(darks, key=lambda x: abs(np.log(x / t)))
+        warn.append(f"No dark at {t:g} ms; used {tn:g} ms scaled.")
+        return np.mean([np.interp(lam, *x) for x in darks[tn]], axis=0) * t / tn
+
+    S = {}
+    for e in meta["spectra"]:
+        lam, I = read(e["file"])
+        t = float(e["exposure_ms"])
+        S[(e["theta"], e["rho"], e["pol"])] = (lam, (I - dark(lam, t)) / t, e)
+        if e.get("max_raw", 0) >= meta.get("saturation_raw", np.inf):
+            warn.append(f"{e['file']} is saturated.")
+    out = []
+    for (th, rho, pol), (lam, Sx, e) in sorted(S.items()):
+        if pol != "crossed":
+            continue
+        if (th, rho, "parallel") not in S:
+            warn.append(f"{e['file']}: no parallel partner; skipped.")
+            continue
+        lam2, Sp, _ = S[(th, rho, "parallel")]
+        Sp = np.interp(lam, lam2, Sp, left=np.nan, right=np.nan)
+        tot = Sx + Sp
+        T = np.full_like(Sx, np.nan)
+        ok = np.isfinite(tot) & (tot > min_ref_fraction * np.nanmax(tot))
+        T[ok] = Sx[ok] / tot[ok]
+        out.append(Spectrum(float(th), float(e["P"]), float(e["A"]), lam, T,
+                            e["file"]))
+    return out, warn, meta
 
 
 # ------------------------------------------------------------------ fitting
