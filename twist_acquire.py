@@ -122,11 +122,16 @@ class FakeSpectrometer:
         pass
 
 
-def grab(spec, exposure_ms, n_avg):
-    """Offset-corrected mean spectrum, raw maximum and offset (same as aseq.measure)."""
+def grab(spec, exposure_ms, n_avg, discard=0):
+    """Offset-corrected mean spectrum, raw maximum and offset (same as aseq.measure).
+
+    The driver (aseq.py, fixed 23. 11. 2026) waits for the CCD to settle after new
+    acquisition parameters; after an exposure change the first frame can still be
+    ~3 % low, so ``discard`` leading frames (default 1) are dropped.
+    """
     if abs(spec.exposure_ms - exposure_ms) > 1e-6:
         spec.set_exposure(exposure_ms)
-    frames = np.asarray(spec.acquire_frames(n_avg), dtype=float)
+    frames = np.asarray(spec.acquire_frames(n_avg + discard), dtype=float)[discard:]
     wl = spec.wavelengths
     active = frames[:, FIRST_ACTIVE:FIRST_ACTIVE + len(wl)]
     offset = frames[:, 4:N_DARK_PIXELS].mean()
@@ -166,6 +171,121 @@ def fname(step):
     raise ValueError
 
 
+# ------------------------------------------------------------------ pattern
+# Same format as dynamic_cell/patterns/patterns.ipynb: 1200 x 1920 array of
+# angles in degrees (1.0 x 1.5 mm), saved with np.save. The values are the
+# exposure POLARIZATION angle (BY easy axis is perpendicular to it), 0° along
+# the long (1920 px) axis, counter-clockwise as seen on the camera; row 0 is
+# the bottom (imshow origin="lower", as in the notebook).
+PATTERN_RES = (1200, 1920)
+PATTERN_SIZE_MM = (1.0, 1.5)
+
+# 5 x 7 bitmap glyphs for the region labels
+_GLYPHS = {
+    "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
+    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+    "°": ["01100", "10010", "10010", "01100", "00000", "00000", "00000"],
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    "3": ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+}
+
+
+def text_mask(text, scale):
+    """Boolean mask (rows top→bottom) of ``text`` drawn with the 5x7 glyphs."""
+    cols = []
+    for ch in text:
+        g = np.array([[c == "1" for c in row] for row in _GLYPHS[ch]])
+        cols += [g, np.zeros((7, 1), bool)]
+    m = np.hstack(cols[:-1]) if cols else np.zeros((7, 0), bool)
+    return np.kron(m, np.ones((scale, scale), bool))
+
+
+def label_text(theta):
+    sign = "+" if theta > 0 else "-" if theta < 0 else ""
+    return f"{sign}{abs(theta):g}°"
+
+
+def pol_angle(easy_axis_deg):
+    """Exposure polarization angle (0–180°) that writes the given BY easy axis."""
+    return (easy_axis_deg + 90.0) % 180.0
+
+
+def make_pattern(thetas, label_easy_deg=0.0, rub_deg=0.0, scale=14, bottom_px=80):
+    """Pattern for the twisted-cell anchoring measurement.
+
+    The image is split along the long axis into len(thetas) equal parts (two
+    regions → halves, the first θ on the left). Region k has its easy axis at
+    rub + θ_k. Its label (e.g. "+80°") is written near the bottom centre of
+    the region with easy axis ``label_easy_deg`` (default: along the rubbing,
+    i.e. untwisted, so it shows up against the twisted region).
+    """
+    ny, nx = PATTERN_RES
+    pol = np.zeros(PATTERN_RES)
+    edges = np.linspace(0, nx, len(thetas) + 1).round().astype(int)
+    for k, th in enumerate(thetas):
+        j0, j1 = edges[k], edges[k + 1]
+        pol[:, j0:j1] = pol_angle(rub_deg + th)
+        sc = scale
+        while sc > 2 and text_mask(label_text(th), sc).shape[1] > 0.8 * (j1 - j0):
+            sc -= 1                                       # shrink to fit narrow regions
+        m = text_mask(label_text(th), sc)[::-1]          # flip: row 0 = bottom
+        h, w = m.shape
+        c0 = (j0 + j1) // 2 - w // 2
+        sub = pol[bottom_px:bottom_px + h, c0:c0 + w]
+        sub[m] = pol_angle(label_easy_deg)
+    return pol
+
+
+def draw_pattern(ax, pol, thetas, label_easy_deg):
+    """Draw a pattern (as from make_pattern) on ``ax``; returns the image."""
+    ext = [0, PATTERN_SIZE_MM[1], 0, PATTERN_SIZE_MM[0]]
+    im = ax.imshow(pol[::2, ::2], origin="lower", cmap="twilight_shifted", vmin=0,
+                   vmax=180, extent=ext, interpolation="nearest")
+    edges = np.linspace(0, PATTERN_SIZE_MM[1], len(thetas) + 1)
+    for k, th in enumerate(thetas):
+        ax.text((edges[k] + edges[k + 1]) / 2, 0.93 * PATTERN_SIZE_MM[0],
+                f"θ = {label_text(th)}\neasy axis {th % 180:g}° · pol {pol_angle(th):g}°",
+                ha="center", va="top", fontsize=8, color="w")
+    ax.set_aspect("equal")
+    ax.set_xlabel("x (mm), rubbing along x"); ax.set_ylabel("y (mm)")
+    ax.set_title(f"Pattern preview ({PATTERN_RES[1]}×{PATTERN_RES[0]} px); labels: easy axis "
+                 f"{label_easy_deg:g}° · pol {pol_angle(label_easy_deg):g}°", fontsize=9)
+    return im
+
+
+def save_pattern(path, thetas, label_easy_deg=0.0):
+    """Save .npy (degrees), a preview .png and a .json with the parameters."""
+    pol = make_pattern(thetas, label_easy_deg)
+    base = os.path.splitext(path)[0]
+    np.save(base + ".npy", pol)
+    fig = Figure(figsize=(8, 5.5), tight_layout=True)
+    ax = fig.add_subplot(111)
+    im = draw_pattern(ax, pol, thetas, label_easy_deg)
+    fig.colorbar(im, ax=ax, label="exposure polarization (°)", shrink=0.7)
+    FigureCanvas(fig).print_png(base + ".png")
+    info = dict(app="twist_acquire", version=APP_VERSION,
+                created=dt.datetime.now().isoformat(timespec="seconds"),
+                file=os.path.basename(base + ".npy"), resolution=list(PATTERN_RES),
+                size_mm=list(PATTERN_SIZE_MM), values="exposure polarization angle (deg), "
+                "0 along the long axis, CCW on camera, row 0 = bottom",
+                rubbing_deg=0.0, regions_deg=list(thetas),
+                region_pol_deg=[pol_angle(t) for t in thetas],
+                label_easy_axis_deg=label_easy_deg,
+                label_pol_deg=pol_angle(label_easy_deg))
+    with open(base + ".json", "w") as f:
+        json.dump(info, f, indent=1)
+    return base + ".npy"
+
+
 class Worker(QtCore.QObject):
     """Runs one acquisition in a thread."""
     done = QtCore.pyqtSignal(object)
@@ -197,7 +317,7 @@ class Worker(QtCore.QObject):
         lo, hi = c["auto_lambda_nm"]
         for _ in range(12):
             self.status.emit(f"Auto exposure: test at {t:g} ms …")
-            wl, s, raw_max, off = grab(self.spec, t, 1)
+            wl, s, raw_max, off = grab(self.spec, t, 1, c.get("discard_frames", 1))
             m = (wl >= lo) & (wl <= hi)
             peak = float(s[m].max())
             if raw_max >= sat:
@@ -222,7 +342,7 @@ class Worker(QtCore.QObject):
             out = []
             for t in self.dark_exposures():
                 self.status.emit(f"Dark {st['when']}: {t:g} ms × {n}")
-                wl, s, raw_max, off = grab(self.spec, t, n)
+                wl, s, raw_max, off = grab(self.spec, t, n, c.get("discard_frames", 1))
                 out.append((t, wl, s, raw_max, off))
             return ("dark", out)
         pol = st["pol"]
@@ -231,7 +351,7 @@ class Worker(QtCore.QObject):
         else:
             t = self.auto_exposure(pol)
         self.status.emit(f"Acquiring {t:g} ms × {n} …")
-        wl, s, raw_max, off = grab(self.spec, t, n)
+        wl, s, raw_max, off = grab(self.spec, t, n, c.get("discard_frames", 1))
         return ("sample", [(t, wl, s, raw_max, off)])
 
 
@@ -273,6 +393,8 @@ class MainWindow(QtWidgets.QMainWindow):
                              "Stage angle increases OPPOSITE to θ"])
         self.navg = QtWidgets.QSpinBox(); self.navg.setRange(1, 100)
         self.navg.setValue(int(self.qs.value("navg", 5)))
+        self.discard = QtWidgets.QSpinBox(); self.discard.setRange(0, 20)
+        self.discard.setValue(int(self.qs.value("discard", 1)))
         self.expmode = QtWidgets.QComboBox(); self.expmode.addItems(["Auto", "Manual"])
         self.exp_x = dspin(0.01, 100000, float(self.qs.value("exp_x", 200)), 2, 10, " ms")
         self.exp_p = dspin(0.01, 100000, float(self.qs.value("exp_p", 20)), 2, 10, " ms")
@@ -283,15 +405,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alo = dspin(300, 1000, 480, 0, 10, " nm")
         self.ahi = dspin(300, 1000, 720, 0, 10, " nm")
         self.expmode.currentIndexChanged.connect(self.mode_changed)
+        self.label_easy = dspin(-90, 180, float(self.qs.value("label_easy", 0)), 1, 5, " °")
+        self.btn_pattern = QtWidgets.QPushButton("Generate pattern .npy…")
+        self.btn_pattern.clicked.connect(self.generate_pattern)
+        self._pat_timer = QtCore.QTimer(self); self._pat_timer.setSingleShot(True)
+        self._pat_timer.setInterval(300)
+        self._pat_timer.timeout.connect(self.preview_pattern)
+        self.regions.textChanged.connect(self._pat_timer.start)
+        self.label_easy.valueChanged.connect(self._pat_timer.start)
 
         form = QtWidgets.QFormLayout()
         form.addRow("Sample name", self.sample)
         fb = QtWidgets.QHBoxLayout(); fb.addWidget(self.base); fb.addWidget(bb)
         form.addRow("Save under", fb)
         form.addRow("Regions θ (°)", self.regions)
+        pr = QtWidgets.QHBoxLayout()
+        pr.addWidget(QtWidgets.QLabel("label easy axis")); pr.addWidget(self.label_easy)
+        pr.addWidget(self.btn_pattern)
+        form.addRow("  pattern", pr)
         form.addRow("Stage angles ρ (°)", self.rhos)
         form.addRow("Stage sense", self.sense)
         form.addRow("Averages per spectrum", self.navg)
+        form.addRow("Discard first frames", self.discard)
         form.addRow("Exposure", self.expmode)
         form.addRow("  crossed", self.exp_x)
         form.addRow("  parallel", self.exp_p)
@@ -343,6 +478,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(split)
         self.status = self.statusBar()
         self.mode_changed()
+        self.preview_pattern()
 
     # ---------------------------------------------------------- setup
     def mode_changed(self, *_):
@@ -355,6 +491,43 @@ class MainWindow(QtWidgets.QMainWindow):
         if d:
             self.base.setText(d)
 
+    def pattern_thetas(self):
+        thetas = parse_list(self.regions.text())
+        if not thetas:
+            raise ValueError("Give at least one region θ.")
+        if any(abs(abs(t) - 90) < 1e-6 for t in thetas):
+            raise ValueError("θ = ±90° gives a degenerate twist sense; use e.g. ±80°.")
+        return thetas
+
+    def preview_pattern(self):
+        """Show the pattern for the current regions in the plot (setup phase only)."""
+        if not self.setup_box.isVisible() and self.meta is not None:
+            return
+        self.ax.clear()
+        try:
+            thetas = self.pattern_thetas()
+            draw_pattern(self.ax, make_pattern(thetas, self.label_easy.value()),
+                         thetas, self.label_easy.value())
+        except Exception as e:
+            self.ax.set_axis_off()
+            self.ax.set_title(f"Pattern preview: {e}", fontsize=9)
+        self.canvas.draw_idle()
+
+    def generate_pattern(self):
+        try:
+            thetas = self.pattern_thetas()
+            name = "twist_pattern_" + "_".join(f"{t:+g}" for t in thetas) + ".npy"
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save pattern", os.path.join(self.base.text(), name), "NumPy (*.npy)")
+            if not path:
+                return
+            out = save_pattern(path, thetas, self.label_easy.value())
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Pattern", str(e)); return
+        self.qs.setValue("label_easy", self.label_easy.value())
+        pols = ", ".join(f"{label_text(t)} → pol {pol_angle(t):g}°" for t in thetas)
+        self.status.showMessage(f"Saved {out} (+ .png, .json): {pols}")
+
     def config(self):
         regions = parse_list(self.regions.text())
         rhos = parse_list(self.rhos.text())
@@ -365,7 +538,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return dict(
             regions_deg=regions, rho_deg=rhos,
             stage_sense=1 if self.sense.currentIndex() == 0 else -1,
-            n_avg=self.navg.value(),
+            n_avg=self.navg.value(), discard_frames=self.discard.value(),
             exposure_mode="manual" if self.expmode.currentText() == "Manual" else "auto",
             exp_crossed_ms=self.exp_x.value(), exp_parallel_ms=self.exp_p.value(),
             max_exposure_ms=self.maxexp.value(), saturation_raw=self.sat.value(),
@@ -376,7 +549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for k, w in (("sample", self.sample), ("base", self.base),
                      ("regions", self.regions), ("rhos", self.rhos)):
             self.qs.setValue(k, w.text())
-        for k, w in (("navg", self.navg), ("exp_x", self.exp_x), ("exp_p", self.exp_p),
+        for k, w in (("navg", self.navg), ("discard", self.discard), ("exp_x", self.exp_x), ("exp_p", self.exp_p),
                      ("maxexp", self.maxexp), ("sat", self.sat)):
             self.qs.setValue(k, w.value())
 
@@ -563,6 +736,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def plot(self, wl, s, title):
         self.ax.clear()
+        self.ax.set_aspect("auto")
         self.ax.plot(wl, s, lw=0.8)
         self.ax.set_xlabel("λ (nm)"); self.ax.set_ylabel("counts (offset-corrected)")
         self.ax.set_title(title, fontsize=9)
