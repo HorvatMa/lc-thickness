@@ -32,8 +32,22 @@ from matplotlib.figure import Figure
 
 APP_VERSION = 1
 META = "measurement.json"
-LADDER_MS = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
 FIRST_ACTIVE, N_DARK_PIXELS = 32, 32      # frame layout, as in aseq.py
+
+
+def ladder_ms(max_ms):
+    """Auto-exposure ladder 0.5, 1, 2, 5, 10, … ms up to ``max_ms`` (the GUI
+    safety maximum); ``max_ms`` itself is added if it is not a ladder value."""
+    out, dec = [0.5], 1.0
+    while True:
+        for f in (1, 2, 5):
+            t = f * dec
+            if t > max_ms + 1e-9:
+                if max_ms > out[-1] + 1e-9:
+                    out.append(float(max_ms))
+                return [t for t in out if t <= max_ms + 1e-9] or [float(max_ms)]
+            out.append(t)
+        dec *= 10
 
 
 # ------------------------------------------------------------------ device
@@ -174,7 +188,8 @@ def fname(step):
 # ------------------------------------------------------------------ pattern
 # Same format as dynamic_cell/patterns/patterns.ipynb: 1200 x 1920 array of
 # angles in degrees (1.0 x 1.5 mm), saved with np.save. The values are the
-# exposure POLARIZATION angle (BY easy axis is perpendicular to it), 0° along
+# exposure POLARIZATION angle (BY easy axis is perpendicular to it), wrapped
+# into [90°, 270°) like the notebook, 0° along
 # the long (1920 px) axis, counter-clockwise as seen on the camera; row 0 is
 # the bottom (imshow origin="lower", as in the notebook).
 PATTERN_RES = (1200, 1920)
@@ -215,8 +230,13 @@ def label_text(theta):
 
 
 def pol_angle(easy_axis_deg):
-    """Exposure polarization angle (0–180°) that writes the given BY easy axis."""
-    return (easy_axis_deg + 90.0) % 180.0
+    """Exposure polarization angle that writes the given BY easy axis.
+
+    Wrapped into [90°, 270°), as in patterns.ipynb (values below 90° or above
+    270° get +180°); the polarization is only defined mod 180°.
+    """
+    v = (easy_axis_deg + 90.0) % 180.0
+    return v + 180.0 if v < 90.0 else v
 
 
 def make_pattern(thetas, label_easy_deg=0.0, rub_deg=0.0, scale=14, bottom_px=80):
@@ -248,8 +268,8 @@ def make_pattern(thetas, label_easy_deg=0.0, rub_deg=0.0, scale=14, bottom_px=80
 def draw_pattern(ax, pol, thetas, label_easy_deg):
     """Draw a pattern (as from make_pattern) on ``ax``; returns the image."""
     ext = [0, PATTERN_SIZE_MM[1], 0, PATTERN_SIZE_MM[0]]
-    im = ax.imshow(pol[::2, ::2], origin="lower", cmap="twilight_shifted", vmin=0,
-                   vmax=180, extent=ext, interpolation="nearest")
+    im = ax.imshow(pol[::2, ::2], origin="lower", cmap="twilight_shifted", vmin=90,
+                   vmax=270, extent=ext, interpolation="nearest")
     edges = np.linspace(0, PATTERN_SIZE_MM[1], len(thetas) + 1)
     for k, th in enumerate(thetas):
         ax.text((edges[k] + edges[k + 1]) / 2, 0.93 * PATTERN_SIZE_MM[0],
@@ -275,7 +295,7 @@ def save_pattern(path, thetas, label_easy_deg=0.0):
     info = dict(app="twist_acquire", version=APP_VERSION,
                 created=dt.datetime.now().isoformat(timespec="seconds"),
                 file=os.path.basename(base + ".npy"), resolution=list(PATTERN_RES),
-                size_mm=list(PATTERN_SIZE_MM), values="exposure polarization angle (deg), "
+                size_mm=list(PATTERN_SIZE_MM), values="exposure polarization angle (deg, in [90, 270)), "
                 "0 along the long axis, CCW on camera, row 0 = bottom",
                 rubbing_deg=0.0, regions_deg=list(thetas),
                 region_pol_deg=[pol_angle(t) for t in thetas],
@@ -306,12 +326,16 @@ class Worker(QtCore.QObject):
         c = self.cfg
         if c["exposure_mode"] == "manual":
             return sorted({c["exp_crossed_ms"], c["exp_parallel_ms"]})
-        return [t for t in LADDER_MS if t <= c["max_exposure_ms"]]
+        if self.step.get("when") == "end":
+            used = sorted({float(s["exposure_ms"]) for s in c.get("spectra", [])})
+            if used:                      # end darks only at the exposures used
+                return used
+        return ladder_ms(c["max_exposure_ms"])
 
     def auto_exposure(self, pol):
         c = self.cfg
         sat = c["saturation_raw"]
-        ladder = [t for t in LADDER_MS if t <= c["max_exposure_ms"]]
+        ladder = ladder_ms(c["max_exposure_ms"])
         t = self.last_exp.get(pol, 10.0 if pol == "crossed" else 2.0)
         t = min(ladder, key=lambda x: abs(x - t))
         lo, hi = c["auto_lambda_nm"]
