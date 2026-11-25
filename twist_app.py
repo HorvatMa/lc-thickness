@@ -135,11 +135,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cell.addItem("Patterned (BY regions θ, rubbed plate strong)", "patterned")
         self.cell.addItem("Uniform (two equal plates, θ = assembly angle)", "uniform")
         self.assembly_err = dspin(0.0, 10, 0.5, 2, 0.1, "°")
+        self.dark_choice = QtWidgets.QComboBox()
+        for k, v in (("mean", "Mean of start and end"), ("start", "Start only"), ("end", "End only")):
+            self.dark_choice.addItem(v, k)
+        self.dark_choice.setToolTip("Dark spectra used for a measurement folder")
         self.cell.currentIndexChanged.connect(self.cell_changed)
 
         form = QtWidgets.QFormLayout()
         form.addRow("Cell", self.cell)
         form.addRow("  assembly angle ±", self.assembly_err)
+        form.addRow("Dark (folder)", self.dark_choice)
         form.addRow("LC / Δn(λ)", self.lc)
         form.addRow("K22", self.k22)
         dr = QtWidgets.QHBoxLayout(); dr.addWidget(self.dmin); dr.addWidget(self.dmax)
@@ -249,7 +254,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not d:
             return
         try:
-            spectra, warn, meta = tm.load_measurement(d)
+            spectra, warn, meta = tm.load_measurement(d, dark_choice=self.dark_choice.currentData())
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Measurement folder", str(e)); return
         self.qs.setValue("dir", os.path.dirname(d))
@@ -336,7 +341,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if s.d_range[0] >= s.d_range[1] or s.lam_range[0] >= s.lam_range[1]:
                 raise ValueError("Check the d and λ ranges.")
             if self.folder:
-                self.spectra, self.warn, _ = tm.load_measurement(self.folder)
+                self.spectra, self.warn, _ = tm.load_measurement(
+                    self.folder, dark_choice=self.dark_choice.currentData())
             else:
                 rows = self.rows()
                 if not rows:

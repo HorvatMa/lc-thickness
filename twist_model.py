@@ -239,13 +239,15 @@ def build_spectra(rows, mode, lam_col=0, int_col=1, ref_path=None,
     return out, warn
 
 
-def load_measurement(folder, min_ref_fraction=0.05):
+def load_measurement(folder, min_ref_fraction=0.05, dark_choice="mean"):
     """Spectra from a twist_acquire measurement folder (measurement.json).
 
     Each spectrum: S = (I − D(t))/t, with I offset-corrected counts, D(t) the
     mean of the start and end dark at the same exposure t (if only one exposure
     is missing, the nearest dark is scaled ∝ t). Pairs crossed/parallel at the
     same θ and ρ give T = S⊥/(S⊥ + S∥), returned at the crossed P, A.
+    dark_choice: "mean" (start and end averaged), "start" or "end" (only that
+    one; falls back to all darks, with a warning, if it is missing).
     Returns (list of Spectrum, warnings, metadata dict).
     """
     with open(os.path.join(folder, "measurement.json")) as f:
@@ -256,10 +258,21 @@ def load_measurement(folder, min_ref_fraction=0.05):
         lam, I = _load(os.path.join(folder, fn), 0, 1)
         return lam, I
 
+    if dark_choice not in ("mean", "start", "end"):
+        raise ValueError(f"Unknown dark choice {dark_choice!r}.")
+    all_darks = meta.get("darks", [])
+    use = all_darks if dark_choice == "mean" else \
+        [d for d in all_darks if d["when"] == dark_choice]
+    if dark_choice != "mean":
+        if use:
+            warn.append(f"Using only the {dark_choice} dark spectra.")
+        elif all_darks:
+            warn.append(f"No {dark_choice} dark spectra; used all darks.")
+            use = all_darks
     darks = {}
-    for d in meta.get("darks", []):
+    for d in use:
         darks.setdefault(float(d["exposure_ms"]), []).append(read(d["file"]))
-    whens = {d["when"] for d in meta.get("darks", [])}
+    whens = {d["when"] for d in all_darks}
     if not darks:
         warn.append("No dark spectra: only the shielded-pixel offset is subtracted.")
     elif whens != {"start", "end"}:
