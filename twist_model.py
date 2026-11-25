@@ -103,6 +103,26 @@ def lag(S, W, K22, d_um):
     return brentq(f, grid[i], grid[i + 1], xtol=1e-14)
 
 
+def lag_symmetric(S, W, K22, d_um):
+    """Lag Δ ≥ 0 (rad) per plate for two plates with equal W (uniform cell).
+
+    Easy axes differ by S; the director twist is |S| − 2Δ. Smallest root of
+    K22(|S| − 2Δ)/d = (W/2) sin 2Δ (torque balance on each plate).
+    """
+    s = abs(S)
+    if s < 1e-12:
+        return 0.0
+    k = K22 / (d_um * 1e-6)
+    f = lambda D: k * (s - 2 * D) - 0.5 * W * np.sin(2 * D)
+    grid = np.linspace(0.0, s / 2, 200)
+    vals = f(grid)
+    idx = np.nonzero(np.sign(vals[:-1]) != np.sign(vals[1:]))[0]
+    if len(idx) == 0:
+        return s / 2 if vals[-1] >= 0 else 0.0
+    i = idx[0]
+    return brentq(f, grid[i], grid[i + 1], xtol=1e-14)
+
+
 def W_from_twist(phi_abs, delta, K22, d_um):
     """W = 2 K22 |Φ| / (d sin 2Δ) (J/m²; angles in rad)."""
     return 2.0 * K22 * phi_abs / (d_um * 1e-6 * np.sin(2 * delta))
@@ -292,6 +312,9 @@ class FitSettings:
     delta_fixed: float = 0.0          # deg
     psi_rub_guess: float = None       # deg; None = scan 0–180°
     max_points: int = 300             # λ points per spectrum used in the fit
+    cell: str = "patterned"           # "patterned" (BY regions, rubbed plate strong)
+                                      # or "uniform" (two equal plates, θ = assembly angle)
+    assembly_err: float = 0.5         # deg, uncertainty of θ for uniform cells
 
 
 @dataclass
@@ -368,12 +391,16 @@ def _scan_region(pp, idx, theta, s: FitSettings):
         psi_grid = s.psi_rub_guess + np.arange(-10.0, 10.1, 5.0)
     t = abs(theta)
     sgn = -1.0 if theta >= 0 else 1.0       # Φ ≈ −θ
+    uniform = s.cell == "uniform"
     phi_grid = sorted({sgn * t * f for f in (1.0, 0.9, 0.75, 0.5)}
                       | ({-4.0, 0.0, 4.0} if t < 10 else set()))
+    if uniform:   # twist sense not set by the pattern: try both
+        phi_grid = sorted(set(phi_grid) | {-x for x in phi_grid})
+    phi_max = 179.0 if uniform else 89.9
     cands = []
     for psi in psi_grid:
         for phi in phi_grid:
-            if abs(phi) >= 89.9:
+            if abs(phi) >= phi_max:
                 continue
             tot = np.zeros(d_grid.size)
             for i in idx:
@@ -424,11 +451,12 @@ def fit_region(pp, idx, theta, s: FitSettings, n_starts=6):
                                  [(psi - phi) * DEG] * len(idx),
                                  psi * DEG, s.free_ab)[0]
 
+    phi_max = 179.0 if s.cell == "uniform" else 89.9
     best = None
     for c in cands[:n_starts]:
         x0 = [c[1], c[2], c[3]]
-        r = least_squares(res, x0, bounds=([s.d_range[0], -360, -89.9],
-                                           [s.d_range[1], 360, 89.9]),
+        r = least_squares(res, x0, bounds=([s.d_range[0], -360, -phi_max],
+                                           [s.d_range[1], 360, phi_max]),
                           x_scale=[0.1, 1.0, 1.0])
         if best is None or r.cost < best.cost:
             best = r
@@ -588,8 +616,84 @@ def pair_estimate(region_fits, K22):
     return out
 
 
+def symmetric_estimate(f: RegionFit, K22, assembly_err):
+    """W of two equal plates from a uniform cell (free region fit f).
+
+    θ = f.theta is the angle between the two easy axes (assembly angle). The
+    deficit 2Δ = |θ| − |Φ| is shared by the two plates (Δ each), and
+    K22|Φ|/d = (W/2) sin 2Δ  →  W = 2 K22 |Φ| / (d sin 2Δ).
+    Uncertainty of 2Δ: σ = hypot(σ_Φ, assembly_err). If 2Δ < σ only a lower
+    bound (from 2Δ + σ) is given.
+    """
+    phi = abs(f.phi)
+    deficit = abs(f.theta) - phi
+    err = float(np.hypot(f.phi_err, assembly_err))
+    W_of = lambda dd: (W_from_twist(phi * DEG, dd / 2 * DEG, K22, f.d)
+                       if dd > 0 else np.inf)
+    out = dict(theta=f.theta, phi=phi, deficit=deficit, deficit_err=err, d=f.d,
+               W=np.nan, W_lo=np.nan, W_hi=np.nan, lower_bound=False)
+    if deficit < err:
+        out.update(lower_bound=True, W_lo=W_of(max(deficit, 0.0) + err))
+    else:
+        out.update(W=W_of(deficit), W_lo=W_of(deficit + err), W_hi=W_of(deficit - err))
+    return out
+
+
+def model_curves_free(pp, s: FitSettings, region_fits, lam_nm_list):
+    """Free-fit T on the full λ grid of each spectrum (uniform cells)."""
+    out = [None] * len(pp.spectra)
+    for f in region_fits:
+        for i, sp in enumerate(pp.spectra):
+            if sp.theta != f.theta:
+                continue
+            args = (f.d, (f.psi_rub - f.phi) * DEG, f.psi_rub * DEG, sp.P * DEG, sp.A * DEG)
+            a, b = _ab(transmission(pp.lam[i], pp.dn[i], *args), pp.T[i], s.free_ab)
+            lam_um = lam_nm_list[i] / 1000.0
+            out[i] = a * transmission(lam_um, s.dn_func(lam_um), *args) + b
+    return out
+
+
+def format_report_uniform(region_fits, sym, s: FitSettings, systematics=None,
+                          warnings=()):
+    L = ["=== Uniform cell (two equal plates, no pattern) ===",
+         "θ = angle between the two easy axes (assembly angle); Φ = director twist.",
+         "The joint fit (one weak BY plate + strong rubbed plate) does not apply and is not run.",
+         ""]
+    for f, e in zip(region_fits, sym):
+        L.append(f"Free fit ({f.n_spectra} spectra): d = {f.d:.3f} ± {f.d_err:.3f} µm, "
+                 f"ψ_rub = {f.psi_rub:.2f} ± {f.psi_rub_err:.2f}°, "
+                 f"Φ = {f.phi:+.2f} ± {f.phi_err:.2f}°, rms = {f.rms:.4f}")
+        if abs(abs(f.phi) - 90) < 0.5:
+            L.append("  (|Φ| ≈ 90°: the twist sense cannot be told from the spectra)")
+        L.append(f"Deficit 2Δ = |θ| − |Φ| = {abs(f.theta):.1f} − {abs(f.phi):.2f} = "
+                 f"{e['deficit']:+.2f} ± {e['deficit_err']:.2f}°  "
+                 f"(σ_Φ ⊕ assembly {s.assembly_err:.2f}°)")
+        if e["lower_bound"]:
+            L.append(f"W > {e['W_lo']:.3g} J/m² per plate (deficit not resolved; lower bound "
+                     f"from 2Δ + σ), K22 = {s.K22 * 1e12:.2f} pN")
+        else:
+            L.append(f"W = {e['W']:.3g} J/m² per plate  (range {e['W_lo']:.3g} – {e['W_hi']:.3g} "
+                     f"for 2Δ ∓ σ), K22 = {s.K22 * 1e12:.2f} pN")
+            L.append(f"b = K22/W = {s.K22 / e['W'] * 1e6:.3g} µm")
+        if e["deficit"] < -e["deficit_err"]:
+            L.append("  ! |Φ| > |θ|: twist larger than the assembly angle. Check θ, or the "
+                     "domain twists the long way.")
+    L.append("Assumes equal W on both plates, Rapini–Papoular anchoring, uniform twist.")
+    if systematics:
+        L.append("")
+        L.append("=== Δn(λ) dataset spread (refit) ===")
+        for name, d, W in systematics:
+            L.append(f"{name}: d = {d:.3f} µm, W = {W:.3g} J/m²")
+    if warnings:
+        L.append("")
+        L.extend("! " + w for w in warnings)
+    return "\n".join(L)
+
+
 def format_report(region_fits, jf: JointFit, pairs, s: FitSettings,
                   systematics=None, warnings=()):
+    if s.cell == "uniform":
+        return format_report_uniform(region_fits, pairs, s, systematics, warnings)
     L = []
     L.append("=== Free fit per region (no anchoring model) ===")
     L.append("θ_set = BY easy axis vs rubbing as patterned; Φ = ψ_rub − ψ_BY")
@@ -643,7 +747,12 @@ def format_report(region_fits, jf: JointFit, pairs, s: FitSettings,
 
 
 def run_all(spectra, s: FitSettings, extra_dn=None, progress=None):
-    """Free region fits, joint fit, ±θ check, optional Δn systematics."""
+    """Free region fits, joint fit, ±θ check, optional Δn systematics.
+
+    Returns (pp, region_fits, joint_fit, pairs, systematics). For a uniform
+    cell (s.cell == "uniform") joint_fit is None and pairs holds the
+    symmetric two-plate estimates (see symmetric_estimate).
+    """
     pp = prepare(spectra, s)
     thetas = sorted({sp.theta for sp in pp.spectra})
     rfs = []
@@ -651,6 +760,18 @@ def run_all(spectra, s: FitSettings, extra_dn=None, progress=None):
         if progress: progress(f"Scanning region θ = {t:+.0f}° …")
         idx = [i for i, sp in enumerate(pp.spectra) if sp.theta == t]
         rfs.append(fit_region(pp, idx, t, s))
+    if s.cell == "uniform":
+        sym = [symmetric_estimate(f, s.K22, s.assembly_err) for f in rfs]
+        syst = []
+        for name, fn in (extra_dn or {}).items():
+            if progress: progress(f"Systematics: {name} …")
+            s2 = FitSettings(**{**s.__dict__, "dn_func": fn,
+                                "d_range": (0.8 * rfs[0].d, 1.2 * rfs[0].d)})
+            pp2 = prepare(spectra, s2)
+            f2 = fit_region(pp2, list(range(len(pp2.spectra))), thetas[0], s2)
+            e2 = symmetric_estimate(f2, s.K22, s.assembly_err)
+            syst.append((name, f2.d, e2["W"] if not e2["lower_bound"] else e2["W_lo"]))
+        return pp, rfs, None, sym, syst
     if progress: progress("Joint fit …")
     jf = fit_joint(pp, s, rfs)
     pairs = pair_estimate(rfs, s.K22)

@@ -80,7 +80,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_rm.clicked.connect(self.remove_rows)
         btn_load.clicked.connect(self.load_list)
         btn_save.clicked.connect(self.save_list)
-        self.theta_new = dspin(-89.9, 89.9, 0.0, 1, 5.0, "°")
+        self.theta_new = dspin(-179, 179, 0.0, 1, 5.0, "°")
         # measurement folder from twist_acquire.py (preferred input)
         self.folder = None
         self.folder_edit = QtWidgets.QLineEdit()
@@ -131,8 +131,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.psi_guess = QtWidgets.QLineEdit()
         self.psi_guess.setPlaceholderText("blank = scan 0–90°")
         self.syst = QtWidgets.QCheckBox("Refit with the other Δn datasets (systematics)")
+        self.cell = QtWidgets.QComboBox()
+        self.cell.addItem("Patterned (BY regions θ, rubbed plate strong)", "patterned")
+        self.cell.addItem("Uniform (two equal plates, θ = assembly angle)", "uniform")
+        self.assembly_err = dspin(0.0, 10, 0.5, 2, 0.1, "°")
+        self.cell.currentIndexChanged.connect(self.cell_changed)
 
         form = QtWidgets.QFormLayout()
+        form.addRow("Cell", self.cell)
+        form.addRow("  assembly angle ±", self.assembly_err)
         form.addRow("LC / Δn(λ)", self.lc)
         form.addRow("K22", self.k22)
         dr = QtWidgets.QHBoxLayout(); dr.addWidget(self.dmin); dr.addWidget(self.dmax)
@@ -186,6 +193,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(split)
         self.status = self.statusBar()
         self.restore()
+        self.cell_changed()
+
+    def cell_changed(self, *_):
+        uniform = self.cell.currentData() == "uniform"
+        self.assembly_err.setEnabled(uniform)
+        for w in (self.fit_delta, self.delta_fixed, self.share_d):
+            w.setEnabled(not uniform)
 
     # ---------------------------------------------------------- table
     def add_row(self, row: tm.Row):
@@ -248,6 +262,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in self.manual_widgets + [self.norm, self.ref, self.dark,
                                         self.lamcol, self.intcol]:
             w.setEnabled(False)
+        self.cell.setCurrentIndex(max(self.cell.findData(meta.get("cell", "patterned")), 0))
         regions = sorted({sp.theta for sp in spectra})
         msg = (f"{meta.get('sample', '')}: {len(spectra)} crossed/parallel pairs, "
                f"regions θ = {', '.join(f'{t:+g}°' for t in regions)}")
@@ -312,7 +327,8 @@ class MainWindow(QtWidgets.QMainWindow):
             free_ab=self.free_ab.isChecked(), share_d=self.share_d.isChecked(),
             fit_delta=self.fit_delta.isChecked(),
             delta_fixed=self.delta_fixed.value(),
-            psi_rub_guess=float(g.replace(",", ".")) if g else None)
+            psi_rub_guess=float(g.replace(",", ".")) if g else None,
+            cell=self.cell.currentData(), assembly_err=self.assembly_err.value())
 
     def run_fit(self):
         try:
@@ -365,7 +381,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.result = res
         pp, rfs, jf, pairs, syst = res
         txt = tm.format_report(rfs, jf, pairs, self.s, syst, self.warn)
-        if len(jf.thetas) == 1:
+        if jf is not None and len(jf.thetas) == 1:
             txt = ("Single region: δ fixed, so W depends on the assembly angle. "
                    "Use ±θ regions for a calibrated W.\n\n" + txt)
         self.report.setPlainText(txt)
@@ -374,6 +390,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def curves(self):
         pp, rfs, jf, pairs, syst = self.result
         lam_full = [sp.lam_nm for sp in pp.spectra]
+        if jf is None:     # uniform cell: free fit only
+            return pp, lam_full, tm.model_curves_free(pp, self.s, rfs, lam_full)
         return pp, lam_full, tm.model_curves(pp, self.s, jf, lam_full)
 
     def draw(self):
@@ -413,7 +431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage(f"Saved {base}.csv/.png", 5000)
 
     # ---------------------------------------------------------- persistence
-    WIDGETS = ("k22", "dmin", "dmax", "lmin", "lmax", "delta_fixed")
+    WIDGETS = ("k22", "dmin", "dmax", "lmin", "lmax", "delta_fixed", "assembly_err")
 
     def restore(self):
         for n in self.WIDGETS:

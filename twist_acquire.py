@@ -6,6 +6,19 @@ app sets the exposure, acquires the spectrum and saves it into one measurement
 folder together with ``measurement.json``. ``twist_app.py`` only needs that
 folder.
 
+Order of the sample steps (setup option "Order", stored as ``order``):
+- ``pairs`` (default): at each ρ, crossed then parallel;
+- ``series``: per region, all ρ crossed, then the analyzer is set parallel
+  once and the same ρ are repeated. Approach every ρ from the same side both
+  times (stage backlash). File names and the analysis are the same.
+
+Cell type (setup option "Cell", stored as ``cell``):
+- ``patterned`` (default): BY regions at θ against a strongly anchoring
+  rubbed plate;
+- ``uniform``: no pattern, e.g. two rubbed plates assembled at θ (e.g. 90°).
+  One "region" whose θ is the assembly angle; twist_app then gives W per
+  plate from the twist deficit θ − |Φ| (equal plates).
+
 Conventions (see the note "Anchoring strength from twisted-cell spectra"):
 - polarizer fixed at P0 = 0° (defines the lab zero); analyzer at 90° (crossed)
   or 0° (parallel);
@@ -114,12 +127,20 @@ class FakeSpectrometer:
             sig = 0.0 * lam
         else:
             p, tm = self.par, self.tm
-            psi_by, _, _ = tm._region_angles(st["theta"], p["delta"], p["W"], 6.2e-12,
-                                             p["d"], p["psi"])
+            psi_ex = p["psi"] * tm.DEG                      # exit (rubbed) easy axis
+            if st.get("cell") == "uniform":
+                # two equal plates, easy axes psi and psi + θ; each lags by Δ
+                S = st["theta"] * tm.DEG
+                D = tm.lag_symmetric(S, p["W"], 6.2e-12, p["d"])
+                psi_by = psi_ex + S - np.sign(S) * D        # entrance director
+                psi_ex = psi_ex + np.sign(S) * D            # exit director
+            else:
+                psi_by, _, _ = tm._region_angles(st["theta"], p["delta"], p["W"],
+                                                 6.2e-12, p["d"], p["psi"])
             rho = p["sense"] * st["rho"] * tm.DEG
             A = (90.0 if st["pol"] == "crossed" else 0.0) * tm.DEG
             T = tm.transmission(lam, self.dn(lam), p["d"], psi_by,
-                                p["psi"] * tm.DEG, -rho, A - rho)
+                                psi_ex, -rho, A - rho)
             sig = self.lamp * T
         dark_current = 3.0 * (self.exp / 100)        # counts, flat
         frames = []
@@ -153,21 +174,51 @@ def grab(spec, exposure_ms, n_avg, discard=0):
 
 
 # ------------------------------------------------------------------ steps
+ORDERS = {"pairs": "Crossed/parallel at each ρ",
+          "series": "All ρ crossed, then all ρ parallel (per region)"}
+
+
+def _sample_step(th, rho, pol):
+    return dict(key=f"R{th:+g}_rho{rho:g}_{pol}", kind="sample", theta=th,
+                rho=rho, pol=pol,
+                text=f"Region θ = {th:+g}°\nStage ρ = {rho:g}°\n"
+                     f"Polarizers {pol.upper()}")
+
+
 def build_steps(cfg):
-    """List of steps: dicts with key, kind, text and the acquisition state."""
+    """List of steps: dicts with key, kind, text and the acquisition state.
+
+    cfg["order"]: "pairs" (crossed + parallel at each ρ; default, also for
+    folders recorded before the option existed) or "series" (per region all ρ
+    crossed, then all ρ parallel).
+    """
+    order = cfg.get("order", "pairs")
+    if order not in ORDERS:
+        raise ValueError(f"Unknown step order {order!r}.")
     steps = [dict(key="dark_start", kind="dark", when="start",
                   text="Block the lamp (dark spectra, start).")]
+    uniform = cfg.get("cell", "patterned") == "uniform"
     for th in cfg["regions_deg"]:
         steps.append(dict(key=f"move_{th:+g}", kind="move", theta=th,
-                          text=f"Move to region θ = {th:+g}° (translate only, do not rotate).\n"
+                          text=("Move to the measurement spot: inside one twist domain, "
+                                "away from disclination lines (translate only).\n"
+                                "Unblock the lamp.") if uniform else
+                               f"Move to region θ = {th:+g}° (translate only, do not rotate).\n"
                                f"Unblock the lamp."))
-        for rho in cfg["rho_deg"]:
-            for pol in ("crossed", "parallel"):
-                steps.append(dict(
-                    key=f"R{th:+g}_rho{rho:g}_{pol}", kind="sample", theta=th,
-                    rho=rho, pol=pol,
-                    text=f"Region θ = {th:+g}°\nStage ρ = {rho:g}°\n"
-                         f"Polarizers {pol.upper()}"))
+        if order == "pairs":
+            for rho in cfg["rho_deg"]:
+                for pol in ("crossed", "parallel"):
+                    steps.append(_sample_step(th, rho, pol))
+        else:
+            for rho in cfg["rho_deg"]:
+                steps.append(_sample_step(th, rho, "crossed"))
+            steps.append(dict(
+                key=f"switch_{th:+g}", kind="switch", theta=th,
+                text=f"Region θ = {th:+g}°: set analyzer PARALLEL.\n"
+                     f"Go back to ρ = {cfg['rho_deg'][0]:g}°, approaching every ρ "
+                     f"from the same side as in the crossed series."))
+            for rho in cfg["rho_deg"]:
+                steps.append(_sample_step(th, rho, "parallel"))
     steps.append(dict(key="dark_end", kind="dark", when="end",
                       text="Block the lamp (dark spectra, end)."))
     return steps
@@ -415,6 +466,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sense = QtWidgets.QComboBox()
         self.sense.addItems(["Stage angle increases in the SAME sense as θ",
                              "Stage angle increases OPPOSITE to θ"])
+        self.cell = QtWidgets.QComboBox()
+        self.cell.addItem("Patterned (BY regions θ)", "patterned")
+        self.cell.addItem("Uniform (no pattern, e.g. rubbed–rubbed)", "uniform")
+        i = self.cell.findData(self.qs.value("cell", "patterned"))
+        self.cell.setCurrentIndex(max(i, 0))
+        self.regions_label = QtWidgets.QLabel()
+        self.order = QtWidgets.QComboBox()
+        for k, v in ORDERS.items():
+            self.order.addItem(v, k)
+        i = self.order.findData(self.qs.value("order", "pairs"))
+        self.order.setCurrentIndex(max(i, 0))
         self.navg = QtWidgets.QSpinBox(); self.navg.setRange(1, 100)
         self.navg.setValue(int(self.qs.value("navg", 5)))
         self.discard = QtWidgets.QSpinBox(); self.discard.setRange(0, 20)
@@ -436,19 +498,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pat_timer.setInterval(300)
         self._pat_timer.timeout.connect(self.preview_pattern)
         self.regions.textChanged.connect(self._pat_timer.start)
+        self.cell.currentIndexChanged.connect(self.cell_changed)
         self.label_easy.valueChanged.connect(self._pat_timer.start)
 
         form = QtWidgets.QFormLayout()
         form.addRow("Sample name", self.sample)
         fb = QtWidgets.QHBoxLayout(); fb.addWidget(self.base); fb.addWidget(bb)
         form.addRow("Save under", fb)
-        form.addRow("Regions θ (°)", self.regions)
+        form.addRow("Cell", self.cell)
+        form.addRow(self.regions_label, self.regions)
         pr = QtWidgets.QHBoxLayout()
         pr.addWidget(QtWidgets.QLabel("label easy axis")); pr.addWidget(self.label_easy)
         pr.addWidget(self.btn_pattern)
         form.addRow("  pattern", pr)
         form.addRow("Stage angles ρ (°)", self.rhos)
         form.addRow("Stage sense", self.sense)
+        form.addRow("Order", self.order)
         form.addRow("Averages per spectrum", self.navg)
         form.addRow("Discard first frames", self.discard)
         form.addRow("Exposure", self.expmode)
@@ -502,9 +567,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(split)
         self.status = self.statusBar()
         self.mode_changed()
-        self.preview_pattern()
+        self.cell_changed()
 
     # ---------------------------------------------------------- setup
+    def uniform(self):
+        return self.cell.currentData() == "uniform"
+
+    def cell_changed(self, *_):
+        u = self.uniform()
+        self.regions_label.setText("Twist angle θ (°)" if u else "Regions θ (°)")
+        self.regions.setToolTip("Angle between the two easy axes (assembly angle), one value"
+                                if u else "Pattern angles θ of the BY regions vs the rubbing")
+        self.label_easy.setEnabled(not u)
+        self.btn_pattern.setEnabled(not u)
+        self.preview_pattern()
+
     def mode_changed(self, *_):
         manual = self.expmode.currentText() == "Manual"
         self.exp_x.setEnabled(manual); self.exp_p.setEnabled(manual)
@@ -528,6 +605,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.setup_box.isVisible() and self.meta is not None:
             return
         self.ax.clear()
+        if self.uniform():
+            self.ax.set_axis_off()
+            self.ax.set_title("Uniform cell: no pattern", fontsize=9)
+            self.canvas.draw_idle()
+            return
         try:
             thetas = self.pattern_thetas()
             draw_pattern(self.ax, make_pattern(thetas, self.label_easy.value()),
@@ -557,11 +639,17 @@ class MainWindow(QtWidgets.QMainWindow):
         rhos = parse_list(self.rhos.text())
         if not regions or not rhos:
             raise ValueError("Give at least one region and one stage angle.")
-        if any(abs(abs(t) - 90) < 1e-6 for t in regions):
+        uniform = self.uniform()
+        if uniform:
+            if len(regions) != 1 or not 0 < abs(regions[0]) <= 90:
+                raise ValueError("Uniform cell: give one twist angle θ with 0 < |θ| ≤ 90°.")
+        elif any(abs(abs(t) - 90) < 1e-6 for t in regions):
             raise ValueError("θ = ±90° gives a degenerate twist sense; use e.g. ±80°.")
         return dict(
+            cell="uniform" if uniform else "patterned",
             regions_deg=regions, rho_deg=rhos,
             stage_sense=1 if self.sense.currentIndex() == 0 else -1,
+            order=self.order.currentData(),
             n_avg=self.navg.value(), discard_frames=self.discard.value(),
             exposure_mode="manual" if self.expmode.currentText() == "Manual" else "auto",
             exp_crossed_ms=self.exp_x.value(), exp_parallel_ms=self.exp_p.value(),
@@ -573,6 +661,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for k, w in (("sample", self.sample), ("base", self.base),
                      ("regions", self.regions), ("rhos", self.rhos)):
             self.qs.setValue(k, w.text())
+        self.qs.setValue("order", self.order.currentData())
+        self.qs.setValue("cell", self.cell.currentData())
         for k, w in (("navg", self.navg), ("discard", self.discard), ("exp_x", self.exp_x), ("exp_p", self.exp_p),
                      ("maxexp", self.maxexp), ("sat", self.sat)):
             self.qs.setValue(k, w.value())
@@ -624,8 +714,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.steps = build_steps(self.meta)
         done = {s["key"] for s in self.meta["spectra"]} | {f"dark_{d['when']}" for d in self.meta["darks"]}
         moved = {s["theta"] for s in self.meta["spectra"]}
+        switched = {s["theta"] for s in self.meta["spectra"] if s["pol"] == "parallel"}
         for st in self.steps:
-            st["done"] = st["key"] in done or (st["kind"] == "move" and st["theta"] in moved)
+            st["done"] = (st["key"] in done
+                          or (st["kind"] == "move" and st["theta"] in moved)
+                          or (st["kind"] == "switch" and st["theta"] in switched))
         for s in self.meta["spectra"]:
             self.last_exp[s["pol"]] = s["exposure_ms"]
         self.refresh_list()
@@ -662,7 +755,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             st = self.steps[self.cur]
             self.instr.setText(st["text"] + ("\n(redo)" if st["done"] else ""))
-            self.btn_ok.setText("OK — continue  (Enter)" if st["kind"] == "move"
+            self.btn_ok.setText("OK — continue  (Enter)" if st["kind"] in ("move", "switch")
                                 else "OK — acquire  (Enter)")
             self.btn_ok.setEnabled(True)
         self.refresh_list()
@@ -677,13 +770,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.busy or not self.btn_ok.isEnabled() or self.cur >= len(self.steps):
             return
         st = self.steps[self.cur]
-        if st["kind"] == "move":
+        if st["kind"] in ("move", "switch"):
             st["done"] = True
             self.goto_next_undone(self.cur + 1)
             return
         if isinstance(self.spec, FakeSpectrometer):
             self.spec.state = (dict(dark=True) if st["kind"] == "dark" else
-                               dict(dark=False, theta=st["theta"], rho=st["rho"], pol=st["pol"]))
+                               dict(dark=False, theta=st["theta"], rho=st["rho"], pol=st["pol"],
+                                    cell=self.meta.get("cell", "patterned")))
         self.busy = True
         self.btn_ok.setEnabled(False)
         old = getattr(self, "_thread", None)
